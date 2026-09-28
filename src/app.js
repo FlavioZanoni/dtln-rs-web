@@ -7,8 +7,8 @@
  *   record  capture a clip, denoise it offline, then A/B the two side by side
  *
  * Both draw the input and the output spectrogram so you can see what the model
- * removed, not just hear it. The spectrograms are deliberately tapped BEFORE
- * the makeup gain (see MAKEUP_GAIN) so the two panels share one scale.
+ * removed, not just hear it. The spectrograms are tapped BEFORE the makeup
+ * gain (see MAKEUP_GAIN) so the two panels share one scale whatever it is.
  */
 
 const SR = 16000;
@@ -16,13 +16,11 @@ const FFT_SIZE = 512; // 31 Hz per bin at 16 kHz
 const BINS = FFT_SIZE / 2;
 
 /**
- * The worklet is unity gain and the model attenuates, so awful applies a 3x
- * makeup gain downstream. What you HEAR here mirrors that, or "after" would
- * sound quieter in the lab than it does on a call. What you SEE does not:
- * both spectrograms are measured pre-gain, or the output panel would read
- * 9.5 dB hot against the input beside it and hide what the model removed.
+ * Mirrors awful's DtlnProcessor.OUTPUT_COMPENSATION, so "after" sounds as
+ * loud here as on a call. 1 since awful levels the mic with AGC before the
+ * worklet (see MIC); it was 3 while that path ran with AGC off.
  */
-const MAKEUP_GAIN = 3.0;
+const MAKEUP_GAIN = 1.0;
 
 /**
  * Measured, by rendering a tone burst through the worklet offline and finding
@@ -286,11 +284,13 @@ async function ensureContext() {
   }
 }
 
+// AGC on, as on an awful call: the gate's threshold is absolute, so judging
+// it on an unleveled mic judges a level no call will ever send it.
 const MIC = {
   channelCount: 1,
   echoCancellation: false,
   noiseSuppression: false,
-  autoGainControl: false,
+  autoGainControl: true,
 };
 
 function friendly(e) {
@@ -480,7 +480,7 @@ async function renderAndShow() {
   paintBuffer(ui.canvasOut, denoised);
   status(
     `${lastClip.duration.toFixed(1)}s - compare below` +
-      (clipped ? ` (${clipped} samples clipped by the 3x makeup gain)` : "")
+      (clipped ? ` (${clipped} samples clipped by the ${MAKEUP_GAIN}x makeup gain)` : "")
   );
 }
 
