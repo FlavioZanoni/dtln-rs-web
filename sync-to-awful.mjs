@@ -14,6 +14,7 @@ const src = fileURLToPath(new URL("./dist/audio-worklet.js", import.meta.url));
 const candidates = [
   process.argv[2],
   process.env.AWFUL_DIR,
+  fileURLToPath(new URL("../awful.chat/", import.meta.url)),
   fileURLToPath(new URL("../awful2/", import.meta.url)),
   fileURLToPath(new URL("../awful/", import.meta.url)),
 ].filter(Boolean);

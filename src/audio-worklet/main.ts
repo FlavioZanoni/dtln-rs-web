@@ -14,6 +14,16 @@ const GATE_ENV_RELEASE = 1.0 - Math.exp(-1.0 / (GATE_BLOCK_RATE * 0.08));
 // survive the gate, close slow (~300 ms) so tails fade instead of chopping.
 const GATE_OPEN_COEFF = 0.7;
 const GATE_CLOSE_COEFF = 0.1;
+// Hold the gate open ~256 ms after the level last cleared the close
+// threshold. Without it the gate started closing inside every dip between
+// syllables, and on a quiet mic (no AGC on the DTLN path) that chopped
+// speech into pieces - the "spotty" voice that only a threshold of 0 fixed.
+const GATE_HOLD_BLOCKS = Math.round(GATE_BLOCK_RATE * 0.256);
+// A closed gate attenuates by 20 dB instead of muting. On top of the model's
+// own suppression that still reads as silence between phrases, and a
+// threshold set too high for someone's mic now dims soft syllables instead
+// of deleting them.
+const GATE_FLOOR = 0.1;
 
 interface AudioWorkletProcessor {
   readonly port: MessagePort;
@@ -49,9 +59,22 @@ dtln.postRun = [
   },
 ];
 
+// The WASM heap is a fixed 16 MB (the build never grows it), each denoiser
+// allocates two tflite interpreters, and dtln_destroy does not hand that
+// memory back. So one instance - one AudioWorkletGlobalScope, i.e. one
+// AudioContext - can create exactly two denoisers in its lifetime. A third
+// dtln_create() either returns a handle whose first denoise traps ("table
+// index is out of bounds") or never returns at all, which would hang the
+// audio thread with no error anywhere. Refuse instead; a fresh context gets
+// a fresh instance and a fresh budget.
+const MAX_DENOISERS_PER_INSTANCE = 2;
+let denoisers_created = 0;
+
 class NoiseSuppressionWorker extends AudioWorkletProcessor {
   private dtln_handle: DtlnPluginOpaqueHandle | undefined;
-  private denoise_failures = 0;
+  // Set when this processor can never produce audio; process() throws it so
+  // the node fires processorerror and the consumer rebuilds on a new context.
+  private fatal: unknown;
 
   // resampling
   private native_rate = 0;
@@ -60,8 +83,9 @@ class NoiseSuppressionWorker extends AudioWorkletProcessor {
   private upsample_frac = 0;
   private upsample_last = 0;
 
-  // anti-alias low-pass before decimation; only used when ratio > 1
-  // (awful runs a 16 kHz context, ratio 1, and never touches this)
+  // anti-alias low-pass before decimation; only used when ratio > 1, which
+  // is every context not at 16 kHz - awful's included, it runs at the
+  // hardware rate
   private aa_coeffs: Float64Array | undefined;
   private aa_state = new Float64Array(8); // x1,x2,y1,y2 per stage
   private aa_buf: Float32Array | undefined;
@@ -84,6 +108,7 @@ class NoiseSuppressionWorker extends AudioWorkletProcessor {
   private gate_envelope = 0;
   private gate_target = 0;
   private gate_open = 0;
+  private gate_hold = 0;
 
   constructor() {
     super();
@@ -97,12 +122,19 @@ class NoiseSuppressionWorker extends AudioWorkletProcessor {
     // a live handle, and the tflite interpreter construction happens here
     // instead of inside a render quantum.
     const announce = () => {
+      if (denoisers_created >= MAX_DENOISERS_PER_INSTANCE) {
+        this.fatal = new Error(
+          `[DTLN] this AudioContext already created ${denoisers_created} ` +
+            "denoisers, the most its WASM heap holds - use a new AudioContext",
+        );
+        return;
+      }
+      denoisers_created++;
       try {
         this.dtln_handle = dtln.dtln_create();
         this.port.postMessage("ready");
       } catch (e) {
-        // No "ready" - the consumer's handshake timeout handles fallback.
-        console.error("[DTLN] failed to create denoiser:", e);
+        this.fatal = e;
       }
     };
     if (wasmReady) announce();
@@ -114,6 +146,10 @@ class NoiseSuppressionWorker extends AudioWorkletProcessor {
     outputs: Float32Array[][],
     _parameters: Record<string, Float32Array>,
   ): boolean {
+    // No "ready" was sent. Throwing fires processorerror, which a consumer
+    // waiting on the handshake sees at once instead of at its timeout.
+    if (this.fatal !== undefined) throw this.fatal;
+
     const input = inputs?.[0]?.[0];
     const output = outputs?.[0]?.[0];
     // Compare against undefined, never truthiness: dtln_create() hands out
@@ -149,26 +185,13 @@ class NoiseSuppressionWorker extends AudioWorkletProcessor {
       src += ratio;
 
       if (this.input_index >= DTLN_FIXED_BUFFER_SIZE) {
-        try {
-          dtln.dtln_denoise(this.dtln_handle, this.input_buf, this.dtln_out);
-          this.denoise_failures = 0;
-        } catch (e) {
-          this.dtln_out.fill(0);
-          // ponytail: recreate the handle at most ~1x/s while failing; the
-          // alternative was permanent silence plus 31 error logs a second.
-          if (this.denoise_failures++ % 32 === 0) {
-            console.error("[DTLN] dtln_denoise failed, recreating handle:", e);
-            // Create before destroy: if create throws we keep the old
-            // (allocated) handle and retry later, instead of denoising
-            // through a freed one.
-            try {
-              const next = dtln.dtln_create();
-              const old = this.dtln_handle;
-              this.dtln_handle = next;
-              dtln.dtln_destroy(old);
-            } catch {}
-          }
-        }
+        // A throw here is a WASM trap, and nothing in this instance can be
+        // trusted after one - recreating the handle in place used up the
+        // instance's denoiser budget (see MAX_DENOISERS_PER_INSTANCE) and
+        // then hung or trapped again. Let it propagate: processorerror tells
+        // the consumer to rebuild on a new context, where a silent zombie
+        // node would have told nobody.
+        dtln.dtln_denoise(this.dtln_handle, this.input_buf, this.dtln_out);
 
         this.applyGate();
 
@@ -225,10 +248,16 @@ class NoiseSuppressionWorker extends AudioWorkletProcessor {
     }
 
     // hysteresis: open at the threshold, close 6 dB below it, so a level
-    // hovering at the threshold doesn't flutter the gate
+    // hovering at the threshold doesn't flutter the gate - and only once the
+    // hold has run out, so the gaps inside a sentence don't close it
     if (this.gate_envelope > this.gate_threshold) {
       this.gate_target = 1.0;
-    } else if (this.gate_envelope < this.gate_threshold * 0.5) {
+      this.gate_hold = GATE_HOLD_BLOCKS;
+    } else if (this.gate_envelope >= this.gate_threshold * 0.5) {
+      if (this.gate_target === 1.0) this.gate_hold = GATE_HOLD_BLOCKS;
+    } else if (this.gate_hold > 0) {
+      this.gate_hold--;
+    } else {
       this.gate_target = 0.0;
     }
 
@@ -239,10 +268,10 @@ class NoiseSuppressionWorker extends AudioWorkletProcessor {
 
     // ramp the gain across the block - a per-block constant steps the gain
     // at 31 Hz, which is audible zipper noise at every transition
-    // ponytail: binary target + hysteresis; upgrade to a soft downward
-    // expander if pumping is ever audible in practice
-    const step = (this.gate_open - prev) / DTLN_FIXED_BUFFER_SIZE;
-    let g = prev;
+    const from = GATE_FLOOR + (1 - GATE_FLOOR) * prev;
+    const to = GATE_FLOOR + (1 - GATE_FLOOR) * this.gate_open;
+    const step = (to - from) / DTLN_FIXED_BUFFER_SIZE;
+    let g = from;
     for (let i = 0; i < DTLN_FIXED_BUFFER_SIZE; i++) {
       g += step;
       this.dtln_out[i] *= g;

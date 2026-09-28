@@ -42,9 +42,13 @@ mic ──▶ [ anti-alias + decimate to 16 kHz ]      only when the context
   burst through it (697 samples). Only 24 ms of that is this worklet's own
   buffering - a 512-sample block minus one 128-sample render quantum - the
   rest is `dtln_denoise`'s own frame delay. On top of the graph's I/O latency.
-- **Gain.** Unity. The model attenuates, so the consumer applies its own
-  makeup gain - deliberately one visible knob outside this worklet rather than
-  two multiplying constants in different repos.
+- **Gain.** Unity, and the model barely touches clean speech (~0.4 dB), so a
+  leveled input needs no makeup gain. Level the mic *before* the worklet -
+  awful asks for the browser's `autoGainControl` - rather than boosting after
+  it: the gate below has a fixed threshold, and an unleveled quiet mic sits
+  right on it. Any makeup gain belongs to the consumer, one visible knob
+  outside this worklet rather than two multiplying constants in different
+  repos.
 - **CPU.** The WASM is SIMD-vectorized and single-threaded; one inference runs
   inline every 4th render quantum at 16 kHz. Measured on a desktop (headless
   Chromium, offline render): ~12 ms of inference per 32 ms block, so roughly
@@ -57,8 +61,18 @@ DTLN suppresses noise but does not silence a quiet channel, so a gate runs on
 its output: block RMS into an envelope follower (instant attack, ~80 ms
 release), a threshold with 6 dB of hysteresis, then a gain that opens with a
 ~27 ms time constant and closes with a ~300 ms one (about 64 ms and 700 ms to
-settle), ramped per sample so transitions don't click. Fast opening is the point - a slow one eats the first syllable after
-every pause.
+settle), ramped per sample so transitions don't click. Fast opening is the
+point - a slow one eats the first syllable after every pause.
+
+Two things keep it from chopping speech. It holds open for ~256 ms after the
+level last cleared the close threshold, so the dips between syllables don't
+start it closing. And closed means -20 dB, not silence: on top of the model's
+own suppression that still reads as quiet between phrases, while a threshold
+set too high for someone's mic dims their soft syllables instead of deleting
+them. Neither fixes an input that is simply too quiet for the threshold -
+that is what leveling the mic is for (see *Gain*). The gate was a hard mute
+with no hold until a quiet headset mic on awful, with AGC off, came through
+as a spotty voice.
 
 Set the threshold with `port.postMessage({ noise_gate })` (RMS, `0` disables
 the gate). The default is `0.002`.
@@ -88,10 +102,19 @@ node.port.postMessage({ noise_gate: 0.002 });
 
 **The `"ready"` handshake is not optional.** The worklet posts it only once the
 WASM runtime has initialized *and* the denoiser exists; until then it outputs
-silence. On a failure it posts nothing at all, so always pair the wait with a
-timeout and an `onprocessorerror` handler, and fall back to the browser's own
-`noiseSuppression` constraint when either fires. Everything else here is loud
-enough to debug; a worklet that never answers is not.
+silence. A denoiser that cannot be created, or that traps mid-stream, throws
+from `process()` instead - that is `processorerror`, never a silent node - so
+always pair the wait with a timeout and an `onprocessorerror` handler, and
+fall back to the browser's own `noiseSuppression` constraint when either
+fires.
+
+**After a `processorerror`, rebuild on a new `AudioContext`.** Every node in a
+context shares one WASM instance, and its heap is a fixed 16 MB that
+`dtln_destroy` does not give back: one instance can create exactly two
+denoisers, ever. A third `dtln_create()` returned a handle that trapped on its
+first block, or never returned and hung the audio thread, so the worklet now
+refuses it (with a `processorerror` saying so). Closing the context and making
+a new one gets a new instance.
 
 ## Building
 
@@ -107,7 +130,8 @@ regenerates `frontend/src/lib/audio/worklet-url.ts` with a content hash
 (`/audio-worklet.js?v=<hash>`). That query is load-bearing: awful's service
 worker caches the worklet forever, so without a changing URL a returning user
 would keep the first build they ever downloaded. **Always sync; never copy the
-bundle by hand.** It looks for `../awful2` (then `../awful`), or takes a path:
+bundle by hand.** It looks for `../awful.chat` (then `../awful2`, `../awful`),
+or takes a path:
 
 ```sh
 node sync-to-awful.mjs ../wherever/awful2     # or set AWFUL_DIR
@@ -128,9 +152,10 @@ already captured, so judging a threshold does not mean recording a new take
 per value. That matters because `0.002` is a guess until someone listens to
 their own voice through it.
 
-What you hear carries the same 3x makeup gain awful applies, so "after" is as
-loud here as on a call; what you *see* does not, so both spectrograms share
-one scale and the output panel is not 9.5 dB hot against the input beside it.
+The mic is captured with `autoGainControl` on, as awful does, so the level
+the gate sees here is the level it sees on a call. The lab runs at 16 kHz,
+though, and awful at the hardware rate - so the lab does not exercise the
+worklet's resampling path; a call does.
 
 **`check.html` - the self-check.** Renders synthetic noise, speech and digital
 silence through the worklet and asserts what comes back:
